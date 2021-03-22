@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+#
+# - check twice to see if we keep persistent connections
+# - also check using http://
+# - throw in there a could of IDNA domains
+# - sparkasse-gießen also sets the ALPN to ""
+# - nexa.polito.it is http/1.1 https
+#
+
+./parallelclient https://www.google.com \
+                 https://www.youtube.com \
+                 http://nexa.polito.it \
+                 https://www.facebook.com \
+                 https://яндекс.рф \
+                 https://www.sparkasse-gießen.de \
+                 http://www.google.com \
+                 https://www.google.com/robots.txt \
+                 https://www.youtube.com/robots.txt \
+                 http://nexa.polito.it/robots.txt \
+                 https://www.facebook.com/robots.txt \
+                 https://яндекс.рф/robots.txt \
+                 https://www.sparkasse-gießen.de/robots.txt \
+                 http://www.google.com/robots.txt
