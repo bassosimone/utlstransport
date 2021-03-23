@@ -59,6 +59,7 @@ func init() {
 // the ALPN negotiated protocol and routing:
 //
 // - "h2" to a default constructed http2.Transport;
+//
 // - "http/1.1" to a default constructed http.Transport.
 //
 // Moreover, cleartext HTTP requests go to a default
