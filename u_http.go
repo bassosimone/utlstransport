@@ -164,7 +164,8 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	}
 	// Step 2: dispatch HTTPS requests to the proper transport
 	child := txp.hostCacheGetOrDefault(req.URL)
-	for {
+	const maxRetries = 4
+	for i := 0; i < maxRetries; i++ {
 		uhttpLog.Printf("uhttp: using transport %s", child)
 		resp, err := child.RoundTrip(req)
 		if !errors.Is(err, errUHTTPNoCachedConn) {
@@ -175,7 +176,7 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		if err == nil {
 			// if this happens then something's wrong with txpDialer
 			resp.Body.Close()
-			return nil, errors.New("uhttp: txp.txpDialer returned nil error")
+			return nil, errors.New("uhttp: bug: txp.txpDialer returned nil error")
 		}
 		if errors.Is(err, errUHTTPUseH2) {
 			child = txp.h2
@@ -187,6 +188,9 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 		}
 		return nil, err // hard dialing error
 	}
+	// if this happens there's something wrong in how we're dialing
+	// and/or caching connections and we should know about it
+	return nil, errors.New("uhttp: bug: cannot get a suitable connection")
 }
 
 // uhttpNoCachedConnRoundTripper is a round tripper that fails
