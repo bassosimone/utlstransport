@@ -17,6 +17,7 @@ import (
 	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/http2"
 	"golang.org/x/net/idna"
+	"golang.org/x/net/proxy"
 )
 
 // uhttpLogger is the type of the optional logger. The log.Default
@@ -82,6 +83,13 @@ type UHTTPTransport struct {
 	// dialer is set, we'll use it for dialing all conns.
 	DialContext func(ctx context.Context, network, address string) (net.Conn, error)
 
+	// Proxy is like the namesake field in http.Transport. If
+	// not initialized, or if it returns a nil URL, then there
+	// will be no proxying of connections. We support the
+	// same types of proxies as the stdlib for HTTP but we
+	// only support socks5 proxies for HTTPS/H2.
+	Proxy func(*http.Request) (*url.URL, error)
+
 	// TLSClientConfig contains optional UTLS configuration for
 	// this transport. We will default-construct a config
 	// instance if this field is not set. Otherwise,
@@ -135,7 +143,9 @@ type UHTTPTransport struct {
 }
 
 // _ ensures that UHTTPTransport matches the http.RoundTripper interface.
-var _ http.RoundTripper = &UHTTPTransport{}
+var _ http.RoundTripper = &UHTTPTransport{
+	Proxy: http.ProxyFromEnvironment,
+}
 
 // UHTTPDefaultTransport is the default UHTTPTransport.
 var UHTTPDefaultTransport http.RoundTripper = &UHTTPTransport{}
@@ -148,6 +158,27 @@ var errUHTTPUseH2 = errors.New("utls: use h2")
 
 // errUHTTPUseHTTPS indicates that we should be using http/1.1 over TLS.
 var errUHTTPUseHTTPS = errors.New("utls: use https")
+
+// uhttpProxyURLKey is the type key to bind a proxy URL to a context.
+type uhttpProxyURLKey struct{}
+
+// uhttpWithProxyURL returns a copy of the current context
+// that keeps track of the current proxy URL. If there
+// is no proxy URL, this function returns the original context.
+func uhttpWithProxyURL(ctx context.Context, proxyURL *url.URL) context.Context {
+	if proxyURL == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, uhttpProxyURLKey{}, proxyURL)
+}
+
+// uhttpContextWithProxyURL returns the proxy URL that
+// we saved in the context so we can honor Proxy. If the
+// user configured no proxy, then we return nil.
+func uhttpContextWithProxyURL(ctx context.Context) *url.URL {
+	URL, _ := ctx.Value(uhttpProxyURLKey{}).(*url.URL)
+	return URL
+}
 
 // RoundTrip implements http.RoundTripper.RoundTrip.
 func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -162,7 +193,12 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	default:
 		return nil, errors.New("uhttp: unsupported URL scheme")
 	}
-	// Step 2: dispatch HTTPS requests to the proper transport
+	// Step 2: check whether we have a proxy URL.
+	proxyURL, err := txp.proxy(req)
+	if err != nil {
+		return nil, err
+	}
+	// Step 3: dispatch HTTPS requests to the proper transport
 	child := txp.hostCacheGetOrDefault(req.URL)
 	const maxRetries = 4
 	for i := 0; i < maxRetries; i++ {
@@ -172,7 +208,9 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			return resp, err // success or hard round trip error
 		}
 		uhttpLog.Printf("uhttp: dialing with transport %s", txp.onlyDial)
-		resp, err = txp.onlyDial.RoundTrip(req)
+		resp, err = txp.onlyDial.RoundTrip(req.WithContext(
+			uhttpWithProxyURL(req.Context(), proxyURL),
+		))
 		if err == nil {
 			// if this happens then something's wrong with txpDialer
 			resp.Body.Close()
@@ -191,6 +229,14 @@ func (txp *UHTTPTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	// if this happens there's something wrong in how we're dialing
 	// and/or caching connections and we should know about it
 	return nil, errors.New("uhttp: bug: cannot get a suitable connection")
+}
+
+// proxy returns the proxy URL (which may be nil) or an error.
+func (txp *UHTTPTransport) proxy(req *http.Request) (*url.URL, error) {
+	if txp.Proxy != nil {
+		return txp.Proxy(req)
+	}
+	return nil, nil
 }
 
 // uhttpNoCachedConnRoundTripper is a round tripper that fails
@@ -260,7 +306,8 @@ func (txp *UHTTPTransport) maybeInitTxps() {
 	if txp.cleartext == nil {
 		txp.cleartext = &uhttpStringer{
 			uhttpCloseableTransport: &http.Transport{
-				DialContext: txp.getDialContext(),
+				DialContext: txp.dialCleartext,
+				Proxy:       txp.Proxy,
 			},
 			name: "cleartext",
 		}
@@ -292,6 +339,18 @@ func (txp *UHTTPTransport) maybeInitTxps() {
 	}
 }
 
+// dialCleartext calls DialContext or uses a default DialContext
+// if no DialContext has been configured by the user.
+func (txp *UHTTPTransport) dialCleartext(
+	ctx context.Context, network, address string) (net.Conn, error) {
+	dialFn := txp.DialContext
+	if dialFn == nil {
+		dialFn = (&net.Dialer{}).DialContext
+	}
+	uhttpLog.Printf("uhttp: dialCleartext %p %s %s", ctx, network, address)
+	return dialFn(ctx, network, address)
+}
+
 // disableDialContext is a DialContext that always fails.
 func (txp *UHTTPTransport) disableDialContext(
 	ctx context.Context, network, address string) (net.Conn, error) {
@@ -305,7 +364,7 @@ func (txp *UHTTPTransport) connCacheDialTLSHTTPS(
 	if conn := txp.connCachePop(address); conn != nil {
 		return conn, nil
 	}
-	uhttpLog.Printf("uhttp: https: cache miss for %s", address)
+	uhttpLog.Printf("uhttp: https: connCache miss for %s", address)
 	return nil, errUHTTPNoCachedConn
 }
 
@@ -327,6 +386,7 @@ func (txp *UHTTPTransport) connCacheDialTLSH2(
 // one of errUHTTPUse{H2,HTTPS}.
 func (txp *UHTTPTransport) dialUTLSContext(
 	ctx context.Context, network, address string) (net.Conn, error) {
+	uhttpLog.Printf("uhttp: dialUTLSContext %p %s %s", ctx, network, address)
 	hostname, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return nil, err
@@ -340,7 +400,11 @@ func (txp *UHTTPTransport) dialUTLSContext(
 	if uconfig.ServerName == "" {
 		uconfig.ServerName = hostname
 	}
-	tcpConn, err := txp.getDialContext()(ctx, network, address)
+	dialContext, err := txp.getDialContextFn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	tcpConn, err := dialContext(ctx, network, address)
 	if err != nil {
 		return nil, err
 	}
@@ -379,7 +443,7 @@ func (txp *UHTTPTransport) hostConnCachePut(
 	if txp.connCache == nil {
 		txp.connCache = make(map[string][]net.Conn)
 	}
-	uhttpLog.Printf("uhttp: connCache put %s => %s", address, conn.RemoteAddr())
+	uhttpLog.Printf("uhttp: connCache put %s => conn#%s", address, conn.RemoteAddr())
 	txp.connCache[address] = append(txp.connCache[address], conn)
 }
 
@@ -394,12 +458,42 @@ func (txp *UHTTPTransport) tlsClientConfig() *utls.Config {
 // dialContextFn is the type of DialContext
 type dialContextFn func(ctx context.Context, network, address string) (net.Conn, error)
 
-// getDialContext returns the proper DialContext function to use.
-func (txp *UHTTPTransport) getDialContext() dialContextFn {
-	if txp.DialContext != nil {
-		return txp.DialContext
+// uhttpForwardDialer allows us to forward a dialContextFn as a dialer.
+type uhttpForwardDialer struct {
+	fn dialContextFn
+}
+
+// Dial is like net.Dialer.Dial.
+func (d *uhttpForwardDialer) Dial(network, address string) (net.Conn, error) {
+	return d.fn(context.Background(), network, address)
+}
+
+// DialContext is like net.Dialer.DialContext.
+func (d *uhttpForwardDialer) DialContext(
+	ctx context.Context, network, address string) (net.Conn, error) {
+	return d.fn(ctx, network, address)
+}
+
+// getDialContextFn returns the proper DialContext function to use. This
+// function will honor the configured ProxyURL, if any.
+func (txp *UHTTPTransport) getDialContextFn(ctx context.Context) (dialContextFn, error) {
+	dialFn := txp.DialContext
+	if dialFn == nil {
+		dialFn = (&net.Dialer{}).DialContext
 	}
-	return (&net.Dialer{}).DialContext
+	proxyURL := uhttpContextWithProxyURL(ctx)
+	if proxyURL == nil {
+		return dialFn, nil
+	}
+	dialer, err := proxy.FromURL(proxyURL, &uhttpForwardDialer{dialFn})
+	if err != nil {
+		return nil, err
+	}
+	contextDialer, good := dialer.(proxy.ContextDialer)
+	if !good {
+		return nil, errors.New("uhttp: bug: cannot get a ContextDialer")
+	}
+	return contextDialer.DialContext, nil
 }
 
 // handshakeTimeout returns the TLS handshake timeout.
@@ -433,7 +527,7 @@ func (txp *UHTTPTransport) connCachePop(address string) net.Conn {
 		} else {
 			delete(txp.connCache, address) // don't keep empty cache entries
 		}
-		uhttpLog.Printf("uhttp: connCache pop %s => %s", address, conn.RemoteAddr())
+		uhttpLog.Printf("uhttp: connCache pop %s => conn#%s", address, conn.RemoteAddr())
 		return conn
 	}
 	return nil
